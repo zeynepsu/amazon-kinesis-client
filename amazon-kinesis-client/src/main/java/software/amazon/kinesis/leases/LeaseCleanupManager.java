@@ -15,7 +15,9 @@
 
 package software.amazon.kinesis.leases;
 
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Queue;
@@ -36,6 +38,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.Value;
 import lombok.experimental.Accessors;
 import lombok.extern.slf4j.Slf4j;
+import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
 import software.amazon.awssdk.utils.CollectionUtils;
 import software.amazon.kinesis.common.StreamIdentifier;
@@ -44,6 +47,9 @@ import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.leases.exceptions.LeasePendingDeletion;
 import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
 import software.amazon.kinesis.metrics.MetricsFactory;
+import software.amazon.kinesis.metrics.MetricsLevel;
+import software.amazon.kinesis.metrics.MetricsScope;
+import software.amazon.kinesis.metrics.MetricsUtil;
 import software.amazon.kinesis.retrieval.AWSExceptionManager;
 import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 
@@ -69,12 +75,28 @@ public class LeaseCleanupManager {
     private final long leaseCleanupIntervalMillis;
     private final long completedLeaseCleanupIntervalMillis;
     private final long garbageLeaseCleanupIntervalMillis;
+    private final int maxLeaseCleanupAttempts;
+    private final long leaseCleanupBackoffBaseMillis;
+    private final long leaseCleanupBackoffMaxMillis;
+    private final boolean relinquishLeaseOnCleanupFailure;
     private final Stopwatch completedLeaseStopwatch = Stopwatch.createUnstarted();
     private final Stopwatch garbageLeaseStopwatch = Stopwatch.createUnstarted();
 
     private final Queue<LeasePendingDeletion> deletionQueue = new ConcurrentLinkedQueue<>();
 
+    /**
+     * Tracks failed lease-deletion attempts so that failures can be backed off (rather than retried on every scan)
+     * and eventually escalated to relinquishment. Confined to the single-threaded cleanup executor, so a plain
+     * {@link HashMap} is sufficient - no concurrent access occurs.
+     */
+    private final Map<String, LeaseCleanupAttempt> cleanupAttempts = new HashMap<>();
+
     private static final long INITIAL_DELAY = 0L;
+
+    private static final String LEASE_CLEANUP_MANAGER_OPERATION = "LeaseCleanupManager";
+    private static final String CLEANUP_FAILURE_METRIC = "LeaseCleanupFailure";
+    private static final String ACCESS_DENIED_METRIC = "LeaseCleanupAccessDenied";
+    private static final String RELINQUISH_METRIC = "LeaseRelinquishedOnCleanupFailure";
 
     @Getter
     private volatile boolean isRunning = false;
@@ -213,6 +235,12 @@ public class LeaseCleanupManager {
                     try {
                         cleanedUpCompletedLease = cleanupLeaseForCompletedShard(lease, shardInfo, childShardKeys);
                     } catch (Exception e) {
+                        if (isAccessDeniedFailure(e)) {
+                            // A permanent access-denied failure on delete cannot be resolved by attempting garbage
+                            // cleanup (which also issues a delete). Propagate so the caller can back off and
+                            // ultimately relinquish the lease rather than spinning on it indefinitely.
+                            throw e;
+                        }
                         // Suppressing the exception here, so that we can attempt for garbage cleanup.
                         log.warn(
                                 "Unable to cleanup lease for shard {} in {}",
@@ -334,6 +362,131 @@ public class LeaseCleanupManager {
         return exceptionManager;
     }
 
+    /**
+     * Handles a failure to delete a lease from the lease table. Transient failures are retried with bounded
+     * exponential backoff. Permanent failures (e.g. {@code AccessDeniedException} from a restrictive IAM policy) or
+     * failures that persist beyond {@link #maxLeaseCleanupAttempts} cause the lease to be relinquished (when
+     * {@link #relinquishLeaseOnCleanupFailure} is enabled) so it can expire and be re-acquired by another worker,
+     * rather than remaining in an unrecoverable "zombie" state.
+     *
+     * @return true if the lease should be removed from the deletion queue (it was relinquished), false if it should
+     *         be re-enqueued for a subsequent retry.
+     */
+    private boolean handleCleanupFailure(final LeasePendingDeletion leasePendingDeletion, final Exception e) {
+        final Lease lease = leasePendingDeletion.lease();
+        final String leaseKey = lease.leaseKey();
+        final StreamIdentifier streamIdentifier = leasePendingDeletion.streamIdentifier();
+
+        final LeaseCleanupAttempt attempt = cleanupAttempts.computeIfAbsent(leaseKey, k -> new LeaseCleanupAttempt());
+        final int attempts = attempt.recordFailure();
+
+        final boolean accessDenied = isAccessDeniedFailure(e);
+        final boolean exhaustedRetries = attempts >= maxLeaseCleanupAttempts;
+
+        emitCleanupFailureMetric(leasePendingDeletion, accessDenied);
+
+        if (relinquishLeaseOnCleanupFailure && (accessDenied || exhaustedRetries)) {
+            log.error(
+                    "Failed to cleanup lease {} for {} after {} attempt(s){}. Relinquishing the lease so it can be "
+                            + "re-acquired by another worker instead of remaining in an unrecoverable state.",
+                    leaseKey,
+                    streamIdentifier,
+                    attempts,
+                    accessDenied ? " due to a permanent access-denied error" : "",
+                    e);
+            try {
+                leaseCoordinator.dropLease(lease);
+                emitRelinquishMetric(leasePendingDeletion);
+                cleanupAttempts.remove(leaseKey);
+                return true;
+            } catch (Exception dropException) {
+                log.error(
+                        "Failed to relinquish lease {} for {}. Will retry on the next scheduled execution.",
+                        leaseKey,
+                        streamIdentifier,
+                        dropException);
+                // Fall through and re-enqueue with backoff so relinquishment is retried.
+            }
+        }
+
+        final long backoffMillis = computeBackoffMillis(attempts);
+        attempt.nextAttemptTimeMillis(System.currentTimeMillis() + backoffMillis);
+        log.warn(
+                "Failed to cleanup lease {} for {} (attempt {} of {}). Will re-enqueue and retry after {} ms.",
+                leaseKey,
+                streamIdentifier,
+                attempts,
+                maxLeaseCleanupAttempts,
+                backoffMillis,
+                e);
+        return false;
+    }
+
+    /**
+     * Computes the exponential backoff delay for a given (1-based) attempt count, capped at
+     * {@link #leaseCleanupBackoffMaxMillis}. The shift is bounded to avoid overflow on high attempt counts.
+     */
+    @VisibleForTesting
+    long computeBackoffMillis(final int attempts) {
+        final int shift = Math.min(Math.max(attempts - 1, 0), 32);
+        final long scaled = leaseCleanupBackoffBaseMillis << shift;
+        // Guard against overflow producing a negative value.
+        if (scaled < 0) {
+            return leaseCleanupBackoffMaxMillis;
+        }
+        return Math.min(scaled, leaseCleanupBackoffMaxMillis);
+    }
+
+    /**
+     * Determines whether the given throwable (or any throwable in its cause chain) represents a permanent
+     * access-denied failure from the lease table - typically a restrictive IAM policy denying
+     * {@code dynamodb:DeleteItem}. Such failures are surfaced from the lease refresher wrapped inside a
+     * {@link DependencyException}, so the whole cause chain is inspected.
+     */
+    @VisibleForTesting
+    static boolean isAccessDeniedFailure(final Throwable throwable) {
+        Throwable current = throwable;
+        while (current != null) {
+            if (current instanceof AwsServiceException) {
+                final AwsServiceException ase = (AwsServiceException) current;
+                if (ase.awsErrorDetails() != null) {
+                    final String errorCode = ase.awsErrorDetails().errorCode();
+                    if ("AccessDeniedException".equals(errorCode) || "AccessDenied".equals(errorCode)) {
+                        return true;
+                    }
+                }
+                if (ase.statusCode() == 403) {
+                    return true;
+                }
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private void emitCleanupFailureMetric(final LeasePendingDeletion leasePendingDeletion, final boolean accessDenied) {
+        final MetricsScope scope =
+                MetricsUtil.createMetricsWithOperation(metricsFactory, LEASE_CLEANUP_MANAGER_OPERATION);
+        try {
+            MetricsUtil.addStreamId(scope, leasePendingDeletion.streamIdentifier());
+            MetricsUtil.addCount(scope, CLEANUP_FAILURE_METRIC, 1, MetricsLevel.SUMMARY);
+            MetricsUtil.addCount(scope, ACCESS_DENIED_METRIC, accessDenied ? 1 : 0, MetricsLevel.SUMMARY);
+        } finally {
+            MetricsUtil.endScope(scope);
+        }
+    }
+
+    private void emitRelinquishMetric(final LeasePendingDeletion leasePendingDeletion) {
+        final MetricsScope scope =
+                MetricsUtil.createMetricsWithOperation(metricsFactory, LEASE_CLEANUP_MANAGER_OPERATION);
+        try {
+            MetricsUtil.addStreamId(scope, leasePendingDeletion.streamIdentifier());
+            MetricsUtil.addCount(scope, RELINQUISH_METRIC, 1, MetricsLevel.SUMMARY);
+        } finally {
+            MetricsUtil.endScope(scope);
+        }
+    }
+
     @VisibleForTesting
     void cleanupLeases() {
         log.info("Number of pending leases to clean before the scan : {}", leasesPendingDeletion());
@@ -350,7 +503,20 @@ public class LeaseCleanupManager {
                 final LeasePendingDeletion leasePendingDeletion = deletionQueue.poll();
                 final String leaseKey = leasePendingDeletion.lease().leaseKey();
                 final StreamIdentifier streamIdentifier = leasePendingDeletion.streamIdentifier();
-                boolean deletionSucceeded = false;
+                boolean removeFromQueue = false;
+
+                // If this lease has failed previously and is still within its backoff window, skip attempting
+                // deletion this round and re-enqueue it to be retried on a later scan.
+                final LeaseCleanupAttempt attempt = cleanupAttempts.get(leaseKey);
+                if (attempt != null && System.currentTimeMillis() < attempt.nextAttemptTimeMillis()) {
+                    log.debug(
+                            "Skipping cleanup of lease {} for {} until backoff window elapses.",
+                            leaseKey,
+                            streamIdentifier);
+                    failedDeletions.add(leasePendingDeletion);
+                    continue;
+                }
+
                 try {
                     final LeaseCleanupResult leaseCleanupResult = cleanupLease(
                             leasePendingDeletion, timeToCheckForCompletedShard(), timeToCheckForGarbageShard());
@@ -363,8 +529,12 @@ public class LeaseCleanupManager {
                                 leaseKey,
                                 streamIdentifier,
                                 leaseCleanupResult);
-                        deletionSucceeded = true;
+                        cleanupAttempts.remove(leaseKey);
+                        removeFromQueue = true;
                     } else {
+                        // No exception was thrown, but the conditions required to delete the lease are not yet met
+                        // (for example, child shards have not begun processing). This is an expected, transient
+                        // situation - keep retrying without counting it against the failure/backoff budget.
                         log.warn(
                                 "Unable to clean up lease {} for {} due to {}",
                                 leaseKey,
@@ -372,14 +542,13 @@ public class LeaseCleanupManager {
                                 leaseCleanupResult);
                     }
                 } catch (Exception e) {
-                    log.error(
-                            "Failed to cleanup lease {} for {}. Will re-enqueue for deletion and retry on next "
-                                    + "scheduled execution.",
-                            leaseKey,
-                            streamIdentifier,
-                            e);
+                    // An actual failure occurred while attempting to delete the lease from the lease table.
+                    // Apply bounded backoff and, for permanent failures (e.g. AccessDenied) or once the retry budget
+                    // is exhausted, relinquish the lease so it can be re-acquired instead of becoming a zombie.
+                    removeFromQueue = handleCleanupFailure(leasePendingDeletion, e);
                 }
-                if (!deletionSucceeded) {
+
+                if (!removeFromQueue) {
                     log.debug(
                             "Did not cleanup lease {} for {}. Re-enqueueing for deletion.", leaseKey, streamIdentifier);
                     failedDeletions.add(leasePendingDeletion);
@@ -415,6 +584,30 @@ public class LeaseCleanupManager {
 
         public boolean leaseCleanedUp() {
             return cleanedUpCompletedLease | cleanedUpGarbageLease;
+        }
+    }
+
+    /**
+     * Mutable per-lease bookkeeping for failed cleanup attempts. Accessed only from the single-threaded cleanup
+     * executor, so it requires no synchronization.
+     */
+    private static class LeaseCleanupAttempt {
+        private int failureCount;
+        private long nextAttemptTimeMillis;
+
+        /**
+         * Records a failed attempt and returns the updated (1-based) failure count.
+         */
+        private int recordFailure() {
+            return ++failureCount;
+        }
+
+        private long nextAttemptTimeMillis() {
+            return nextAttemptTimeMillis;
+        }
+
+        private void nextAttemptTimeMillis(final long nextAttemptTimeMillis) {
+            this.nextAttemptTimeMillis = nextAttemptTimeMillis;
         }
     }
 }

@@ -28,15 +28,20 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.runners.MockitoJUnitRunner;
+import software.amazon.awssdk.awscore.exception.AwsErrorDetails;
+import software.amazon.awssdk.services.dynamodb.model.DynamoDbException;
 import software.amazon.awssdk.services.kinesis.model.ChildShard;
 import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
 import software.amazon.kinesis.common.StreamIdentifier;
+import software.amazon.kinesis.leases.exceptions.DependencyException;
 import software.amazon.kinesis.leases.exceptions.LeasePendingDeletion;
 import software.amazon.kinesis.metrics.MetricsFactory;
 import software.amazon.kinesis.metrics.NullMetricsFactory;
 import software.amazon.kinesis.retrieval.kpl.ExtendedSequenceNumber;
 
 import static org.mockito.Matchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -53,6 +58,10 @@ public class LeaseCleanupManagerTest {
     private final long completedLeaseCleanupIntervalMillis =
             Duration.ofSeconds(0).toMillis();
     private final long garbageLeaseCleanupIntervalMillis = Duration.ofSeconds(0).toMillis();
+    private final int maxLeaseCleanupAttempts = 3;
+    private final long leaseCleanupBackoffBaseMillis = 0L;
+    private final long leaseCleanupBackoffMaxMillis = 0L;
+    private boolean relinquishLeaseOnCleanupFailure = true;
     private boolean cleanupLeasesOfCompletedShards = true;
     private LeaseCleanupManager leaseCleanupManager;
     private static final MetricsFactory NULL_METRICS_FACTORY = new NullMetricsFactory();
@@ -71,16 +80,24 @@ public class LeaseCleanupManagerTest {
 
     @Before
     public void setUp() throws Exception {
-        leaseCleanupManager = new LeaseCleanupManager(
+        leaseCleanupManager = buildLeaseCleanupManager();
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+    }
+
+    private LeaseCleanupManager buildLeaseCleanupManager() {
+        return new LeaseCleanupManager(
                 leaseCoordinator,
                 NULL_METRICS_FACTORY,
                 deletionThreadPool,
                 cleanupLeasesOfCompletedShards,
                 leaseCleanupIntervalMillis,
                 completedLeaseCleanupIntervalMillis,
-                garbageLeaseCleanupIntervalMillis);
-
-        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+                garbageLeaseCleanupIntervalMillis,
+                maxLeaseCleanupAttempts,
+                leaseCleanupBackoffBaseMillis,
+                leaseCleanupBackoffMaxMillis,
+                relinquishLeaseOnCleanupFailure);
     }
 
     /**
@@ -133,14 +150,7 @@ public class LeaseCleanupManagerTest {
     public final void testNoLeasesDeletedWhenNotEnabled() throws Exception {
         cleanupLeasesOfCompletedShards = false;
 
-        leaseCleanupManager = new LeaseCleanupManager(
-                leaseCoordinator,
-                NULL_METRICS_FACTORY,
-                deletionThreadPool,
-                cleanupLeasesOfCompletedShards,
-                leaseCleanupIntervalMillis,
-                completedLeaseCleanupIntervalMillis,
-                garbageLeaseCleanupIntervalMillis);
+        leaseCleanupManager = buildLeaseCleanupManager();
 
         verifyExpectedDeletedLeasesCompletedShardCase(
                 SHARD_INFO, childShardsForSplit(), ExtendedSequenceNumber.LATEST, 0);
@@ -221,14 +231,7 @@ public class LeaseCleanupManagerTest {
 
         cleanupLeasesOfCompletedShards = false;
 
-        leaseCleanupManager = new LeaseCleanupManager(
-                leaseCoordinator,
-                NULL_METRICS_FACTORY,
-                deletionThreadPool,
-                cleanupLeasesOfCompletedShards,
-                leaseCleanupIntervalMillis,
-                completedLeaseCleanupIntervalMillis,
-                garbageLeaseCleanupIntervalMillis);
+        leaseCleanupManager = buildLeaseCleanupManager();
 
         testLeaseDeletedWhenShardDoesNotExist(heldLease);
     }
@@ -243,6 +246,230 @@ public class LeaseCleanupManagerTest {
 
         verify(shardDetector).getChildShards(SHARD_INFO.shardId());
         verify(leaseRefresher).deleteLease(heldLease);
+    }
+
+    /**
+     * Reproduces the COE failure mode: lease deletion is permanently denied (IAM deny on
+     * {@code dynamodb:DeleteItem}). The lease must not be retried forever; instead it is relinquished on the first
+     * permanent failure so another worker can re-acquire the shard rather than it becoming a zombie.
+     */
+    @Test
+    public final void testLeaseRelinquishedOnAccessDeniedDuringCleanup() throws Exception {
+        final Lease heldLease =
+                LeaseHelper.createLease(SHARD_INFO.shardId(), "leaseOwner", Collections.singleton("parentShardId"));
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+        when(shardDetector.getChildShards(any(String.class))).thenThrow(ResourceNotFoundException.class);
+        when(leaseRefresher.getLease(heldLease.leaseKey())).thenReturn(heldLease);
+        doThrow(new DependencyException(accessDeniedException()))
+                .when(leaseRefresher)
+                .deleteLease(heldLease);
+
+        leaseCleanupManager.enqueueForDeletion(createLeasePendingDeletion(heldLease, SHARD_INFO));
+        leaseCleanupManager.cleanupLeases();
+
+        // Permanent failure -> relinquish immediately (do not wait for the retry budget to be exhausted).
+        verify(leaseCoordinator, times(1)).dropLease(heldLease);
+
+        // Lease was removed from the queue, so a subsequent scan attempts no further deletions.
+        leaseCleanupManager.cleanupLeases();
+        verify(leaseRefresher, times(1)).deleteLease(heldLease);
+    }
+
+    /**
+     * A transient (non-permanent) failure should be retried with backoff and only relinquished once the configured
+     * maximum number of attempts has been reached.
+     */
+    @Test
+    public final void testLeaseRetriedThenRelinquishedAfterMaxAttempts() throws Exception {
+        final Lease heldLease =
+                LeaseHelper.createLease(SHARD_INFO.shardId(), "leaseOwner", Collections.singleton("parentShardId"));
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+        when(shardDetector.getChildShards(any(String.class))).thenThrow(ResourceNotFoundException.class);
+        when(leaseRefresher.getLease(heldLease.leaseKey())).thenReturn(heldLease);
+        doThrow(new DependencyException(new RuntimeException("transient DynamoDB failure")))
+                .when(leaseRefresher)
+                .deleteLease(heldLease);
+
+        leaseCleanupManager.enqueueForDeletion(createLeasePendingDeletion(heldLease, SHARD_INFO));
+
+        // Backoff base is 0 in tests, so each scan retries. First (maxLeaseCleanupAttempts - 1) scans retry only.
+        for (int i = 0; i < maxLeaseCleanupAttempts - 1; i++) {
+            leaseCleanupManager.cleanupLeases();
+        }
+        verify(leaseCoordinator, never()).dropLease(any(Lease.class));
+
+        // The attempt that reaches maxLeaseCleanupAttempts relinquishes the lease.
+        leaseCleanupManager.cleanupLeases();
+        verify(leaseCoordinator, times(1)).dropLease(heldLease);
+        verify(leaseRefresher, times(maxLeaseCleanupAttempts)).deleteLease(heldLease);
+    }
+
+    /**
+     * When relinquishment is disabled, an undeletable lease is retried indefinitely and never relinquished
+     * (preserving the legacy behavior for operators who opt out).
+     */
+    @Test
+    public final void testLeaseNotRelinquishedWhenDisabled() throws Exception {
+        relinquishLeaseOnCleanupFailure = false;
+        leaseCleanupManager = buildLeaseCleanupManager();
+
+        final Lease heldLease =
+                LeaseHelper.createLease(SHARD_INFO.shardId(), "leaseOwner", Collections.singleton("parentShardId"));
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+        when(shardDetector.getChildShards(any(String.class))).thenThrow(ResourceNotFoundException.class);
+        when(leaseRefresher.getLease(heldLease.leaseKey())).thenReturn(heldLease);
+        doThrow(new DependencyException(accessDeniedException()))
+                .when(leaseRefresher)
+                .deleteLease(heldLease);
+
+        leaseCleanupManager.enqueueForDeletion(createLeasePendingDeletion(heldLease, SHARD_INFO));
+        leaseCleanupManager.cleanupLeases();
+        leaseCleanupManager.cleanupLeases();
+
+        verify(leaseCoordinator, never()).dropLease(any(Lease.class));
+        // Still re-enqueued and retried on each scan.
+        verify(leaseRefresher, times(2)).deleteLease(heldLease);
+    }
+
+    /**
+     * Unit-tests the access-denied classification, including unwrapping of the {@link DependencyException} that the
+     * lease refresher wraps DynamoDB exceptions in.
+     */
+    @Test
+    public final void testIsAccessDeniedFailureClassification() {
+        Assert.assertTrue(LeaseCleanupManager.isAccessDeniedFailure(accessDeniedException()));
+        Assert.assertTrue(LeaseCleanupManager.isAccessDeniedFailure(new DependencyException(accessDeniedException())));
+        // A 403 with no modeled error code is still treated as access-denied.
+        Assert.assertTrue(LeaseCleanupManager.isAccessDeniedFailure(statusOnly403Exception()));
+        Assert.assertFalse(
+                LeaseCleanupManager.isAccessDeniedFailure(new DependencyException(new RuntimeException("transient"))));
+        Assert.assertFalse(LeaseCleanupManager.isAccessDeniedFailure(null));
+    }
+
+    /**
+     * If relinquishment itself fails (e.g. {@code dropLease} throws), the lease is re-enqueued and relinquishment is
+     * retried on the next scan rather than being silently dropped from the queue.
+     */
+    @Test
+    public final void testLeaseReenqueuedWhenRelinquishFails() throws Exception {
+        final Lease heldLease =
+                LeaseHelper.createLease(SHARD_INFO.shardId(), "leaseOwner", Collections.singleton("parentShardId"));
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+        when(shardDetector.getChildShards(any(String.class))).thenThrow(ResourceNotFoundException.class);
+        when(leaseRefresher.getLease(heldLease.leaseKey())).thenReturn(heldLease);
+        doThrow(new DependencyException(accessDeniedException()))
+                .when(leaseRefresher)
+                .deleteLease(heldLease);
+        doThrow(new RuntimeException("drop failed")).when(leaseCoordinator).dropLease(heldLease);
+
+        leaseCleanupManager.enqueueForDeletion(createLeasePendingDeletion(heldLease, SHARD_INFO));
+
+        leaseCleanupManager.cleanupLeases();
+        verify(leaseCoordinator, times(1)).dropLease(heldLease);
+
+        // Relinquish failed, so the lease remains enqueued and is retried on the next scan.
+        leaseCleanupManager.cleanupLeases();
+        verify(leaseCoordinator, times(2)).dropLease(heldLease);
+        verify(leaseRefresher, times(2)).deleteLease(heldLease);
+    }
+
+    /**
+     * Verifies the exponential backoff computation, including the cap and the overflow guard for extreme
+     * configuration values.
+     */
+    @Test
+    public final void testComputeBackoffMillisCapAndOverflow() {
+        final LeaseCleanupManager manager = new LeaseCleanupManager(
+                leaseCoordinator,
+                NULL_METRICS_FACTORY,
+                deletionThreadPool,
+                cleanupLeasesOfCompletedShards,
+                leaseCleanupIntervalMillis,
+                completedLeaseCleanupIntervalMillis,
+                garbageLeaseCleanupIntervalMillis,
+                maxLeaseCleanupAttempts,
+                5_000L,
+                300_000L,
+                true);
+
+        Assert.assertEquals(5_000L, manager.computeBackoffMillis(1));
+        Assert.assertEquals(10_000L, manager.computeBackoffMillis(2));
+        // Large attempt count is capped at the configured maximum.
+        Assert.assertEquals(300_000L, manager.computeBackoffMillis(100));
+
+        // A base large enough to overflow when shifted must fall back to the configured maximum, never negative.
+        final LeaseCleanupManager overflowManager = new LeaseCleanupManager(
+                leaseCoordinator,
+                NULL_METRICS_FACTORY,
+                deletionThreadPool,
+                cleanupLeasesOfCompletedShards,
+                leaseCleanupIntervalMillis,
+                completedLeaseCleanupIntervalMillis,
+                garbageLeaseCleanupIntervalMillis,
+                maxLeaseCleanupAttempts,
+                Long.MAX_VALUE,
+                300_000L,
+                true);
+        Assert.assertEquals(300_000L, overflowManager.computeBackoffMillis(2));
+    }
+
+    /**
+     * Verifies that after a failed deletion a lease is not retried again until its backoff window has elapsed.
+     */
+    @Test
+    public final void testBackoffWindowSkipsRetryUntilElapsed() throws Exception {
+        // Non-zero backoff and relinquishment disabled so the lease stays enqueued and the backoff gate is exercised.
+        final LeaseCleanupManager manager = new LeaseCleanupManager(
+                leaseCoordinator,
+                NULL_METRICS_FACTORY,
+                deletionThreadPool,
+                cleanupLeasesOfCompletedShards,
+                leaseCleanupIntervalMillis,
+                completedLeaseCleanupIntervalMillis,
+                garbageLeaseCleanupIntervalMillis,
+                maxLeaseCleanupAttempts,
+                60_000L,
+                60_000L,
+                false);
+
+        final Lease heldLease =
+                LeaseHelper.createLease(SHARD_INFO.shardId(), "leaseOwner", Collections.singleton("parentShardId"));
+
+        when(leaseCoordinator.leaseRefresher()).thenReturn(leaseRefresher);
+        when(shardDetector.getChildShards(any(String.class))).thenThrow(ResourceNotFoundException.class);
+        when(leaseRefresher.getLease(heldLease.leaseKey())).thenReturn(heldLease);
+        doThrow(new DependencyException(new RuntimeException("transient DynamoDB failure")))
+                .when(leaseRefresher)
+                .deleteLease(heldLease);
+
+        manager.enqueueForDeletion(createLeasePendingDeletion(heldLease, SHARD_INFO));
+
+        // First scan attempts deletion and fails, arming a 60s backoff window.
+        manager.cleanupLeases();
+        // Second scan happens immediately; the lease is still within its backoff window and must be skipped.
+        manager.cleanupLeases();
+
+        verify(leaseRefresher, times(1)).deleteLease(heldLease);
+        verify(leaseCoordinator, never()).dropLease(any(Lease.class));
+    }
+
+    private static DynamoDbException accessDeniedException() {
+        return (DynamoDbException) DynamoDbException.builder()
+                .awsErrorDetails(AwsErrorDetails.builder()
+                        .errorCode("AccessDeniedException")
+                        .build())
+                .statusCode(403)
+                .message("User is not authorized to perform: dynamodb:DeleteItem")
+                .build();
+    }
+
+    private static DynamoDbException statusOnly403Exception() {
+        return (DynamoDbException)
+                DynamoDbException.builder().statusCode(403).message("Forbidden").build();
     }
 
     private void verifyExpectedDeletedLeasesCompletedShardCase(

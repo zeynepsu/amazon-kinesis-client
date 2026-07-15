@@ -379,7 +379,11 @@ public class DynamoDBLeaseManagementFactory implements LeaseManagementFactory {
                 cleanupLeasesUponShardCompletion,
                 leaseCleanupConfig.leaseCleanupIntervalMillis(),
                 leaseCleanupConfig.completedLeaseCleanupIntervalMillis(),
-                leaseCleanupConfig.garbageLeaseCleanupIntervalMillis());
+                leaseCleanupConfig.garbageLeaseCleanupIntervalMillis(),
+                leaseCleanupConfig.maxLeaseCleanupAttempts(),
+                leaseCleanupConfig.leaseCleanupBackoffBaseMillis(),
+                leaseCleanupConfig.leaseCleanupBackoffMaxMillis(),
+                leaseCleanupConfig.relinquishLeaseOnCleanupFailure());
     }
 
     @Override
